@@ -1,5 +1,14 @@
 # %%
+import tensorflow as tf
+from sklearn import preprocessing
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from tqdm import tqdm
 
+from tensorflow import keras
+import datetime
+from tensorboard.plugins.hparams import api as hp
+from sklearn.metrics import r2_score
 import pandas as pd
 import numpy as np
 
@@ -13,7 +22,6 @@ df.info()
 # %%
 
 # Item Weight
-from tqdm import tqdm
 
 # Some items does not have weight, but they have the same ID as other items that have weight.
 # I expect an item with the same ID to also have the weight.
@@ -71,7 +79,6 @@ df['Item_Fat_Content'] = df['Item_Fat_Content'].map({
     'reg': 'Regular'
 })
 unique_item_fat_content = pd.unique(df['Item_Fat_Content'])
-unique_item_fat_content
 
 # %%
 
@@ -150,7 +157,6 @@ X = outlets[['Outlet_Establishment_Year',
              'Outlet_Type']]
 
 y = outlets['Outlet_Size']
-from sklearn.model_selection import train_test_split
 
 # I have tested with a test train split, and tried different combinations.
 # Its hard to learn anything from such a small dataset, but since KNN "learns"
@@ -159,8 +165,6 @@ from sklearn.model_selection import train_test_split
 # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=2/7, random_state=3)
 
 # %%
-
-from sklearn.neighbors import KNeighborsClassifier
 
 # uses brute force because of the tiny dataset
 neighs = [KNeighborsClassifier(n_neighbors=i, algorithm='brute') for i in range(1, 6)]
@@ -209,48 +213,42 @@ X = df.loc[:, df.columns != 'Item_Outlet_Sales']
 
 y = df['Item_Outlet_Sales']
 
-from sklearn import preprocessing
-
 min_max_scaler = preprocessing.MinMaxScaler()
 x_scaled = min_max_scaler.fit_transform(X)
 X = pd.DataFrame(x_scaled)
 
 X = X.to_numpy()
 y = y.to_numpy()
-X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=1, test_size=0.1)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=11, test_size=0.1)
 # Using a dev set to better evaluate the models
-X_train, X_dev, y_train, y_dev = train_test_split(X_train, y_train, random_state=1, test_size=0.1)
+X_train, X_dev, y_train, y_dev = train_test_split(X_train, y_train, random_state=11, test_size=0.1)
+
+
 
 # %%
 
 # Since making model architectures are hard, I dont want to do it myself.
 # I will set the features of the model as hyper parameters.
 
-import tensorflow as tf
-
-physical_devices = tf.config.list_physical_devices('GPU')
-tf.config.experimental.set_memory_growth(physical_devices[0], True)
-from tensorflow import keras
-import datetime
-from tensorboard.plugins.hparams import api as hp
-from sklearn.metrics import r2_score
+# physical_devices = tf.config.list_physical_devices('GPU')
+# tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 logdir = "logs\\fit\\" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=logdir, histogram_freq=1)
 
-HP_LAYERS = hp.HParam('layers', hp.Discrete([1, 2, 3, 4]))
+HP_LAYERS = hp.HParam('layers', hp.Discrete([2, 3, 4]))
 HP_LAYER_WIDTH = hp.HParam('layers_width', hp.Discrete([4, 8, 16, 32]))
 HP_DROPOUT = hp.HParam('dropout', hp.RealInterval(0.1, 0.2))
 HP_OPTIMIZER = hp.HParam('optimizer', hp.Discrete(['adam']))
-HP_ACTIVATION = hp.HParam('activation', hp.Discrete(['relu']))
-HP_BATCH_SIZE = hp.HParam('batch_size', hp.Discrete([8, 16, 32, 64, 128, 256]))
-
+HP_ACTIVATION = hp.HParam('activation', hp.Discrete(['relu', 'softmax']))
+HP_BATCH_SIZE = hp.HParam('batch_size', hp.Discrete([64, 128]))
 
 METRIC = 'mae'
 
 with tf.summary.create_file_writer('logs\\hparam_tuning').as_default():
     hp.hparams_config(
-        hparams=[HP_LAYERS, HP_LAYER_WIDTH, HP_DROPOUT, HP_OPTIMIZER, HP_ACTIVATION],
+        hparams=[HP_LAYERS, HP_LAYER_WIDTH, HP_DROPOUT, HP_OPTIMIZER, HP_ACTIVATION, HP_BATCH_SIZE],
         metrics=[hp.Metric(METRIC, display_name='mae')],
     )
 
@@ -261,20 +259,20 @@ def train_test_model(hparams):
     for layer in range(hparams[HP_LAYERS]):
         model.add(tf.keras.layers.Dense(hparams[HP_LAYER_WIDTH], activation=hparams[HP_ACTIVATION]))
         model.add(tf.keras.layers.Dropout(hparams[HP_DROPOUT]))
-    model.add(tf.keras.layers.Dense(1, activation=hparams[HP_ACTIVATION]))
+    model.add(tf.keras.layers.Dense(1, activation='relu'))
 
     model.compile(
         optimizer=hparams[HP_OPTIMIZER],
-        loss=METRIC
+        loss=METRIC,
     )
 
-    model.fit(X_train, y_train, hparams[HP_BATCH_SIZE], epochs=1000, callbacks=[
-        tf.keras.callbacks.EarlyStopping(monitor='loss', patience=10),
+    model.fit(X_train, y_train, hparams[HP_BATCH_SIZE], validation_data=(X_dev, y_dev), epochs=1000, callbacks=[
+        tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=25),
         tf.keras.callbacks.TensorBoard(logdir),  # log metrics
         hp.KerasCallback(logdir, hparams),  # log hparams
-        # tf.keras.callbacks.EarlyStopping(monitor='loss', patience=10)
-    ])  # Run with 1 epoch to speed things up for demo purposes
-    _, mae = model.evaluate(X_test, y_test)
+    ])
+
+    mae = model.evaluate(X_test, y_test)
     return mae
 
 
@@ -285,14 +283,14 @@ def run(run_dir, hparams):
         tf.summary.scalar(METRIC, mae, step=1)
 
 
-session_num = 1 # has to be unique for each run
+session_num = 1  # has to be unique for each run
 
-for layers in HP_LAYERS.domain.values:
-    for layer_width in HP_LAYER_WIDTH.domain.values:
+for batch_size in HP_BATCH_SIZE.domain.values:
+    for optimizer in HP_OPTIMIZER.domain.values:
         for dropout_rate in (HP_DROPOUT.domain.min_value, HP_DROPOUT.domain.max_value):
-            for optimizer in HP_OPTIMIZER.domain.values:
-                for activation in HP_ACTIVATION.domain.values:
-                    for batch_size in HP_BATCH_SIZE.domain.values:
+            for activation in HP_ACTIVATION.domain.values:
+                for layer_width in HP_LAYER_WIDTH.domain.values:
+                    for layers in HP_LAYERS.domain.values:
                         hparams = {
                             HP_LAYERS: layers,
                             HP_LAYER_WIDTH: layer_width,
